@@ -242,6 +242,22 @@ def trigger_5m(candles: list[Candle], direction: int, vol: float) -> str | None:
     return None
 
 
+
+def has_confirmed_zone_touch(five: list[Candle], fifteen: list[Candle], zone: Zone) -> bool:
+    """Require an actual 5m OHLC overlap strictly AFTER the 15m zone was confirmed.
+
+    A bar ending alongside the 15m formation bar cannot validate that zone.
+    Compare single-bar ranges, never extrema aggregated across unrelated bars.
+    Uses only the last six completed 5m bars and no future data.
+    """
+    if not 0 <= zone.created < len(fifteen) or zone.high <= zone.low:
+        return False
+    confirmed_at = fifteen[zone.created].close_time
+    return any(c.open_time > confirmed_at and
+               c.low <= zone.high and c.high >= zone.low
+               for c in five[-6:])
+
+
 def make_signal(symbol: str, fifteen: list[Candle], hourly: list[Candle], five: list[Candle],
                 quote_volume: float, min_score: int = 75) -> Optional[Signal]:
     if (len(fifteen) < 65 or len(hourly) < 65 or len(five) < 55 or
@@ -267,14 +283,8 @@ def make_signal(symbol: str, fifteen: list[Candle], hourly: list[Candle], five: 
 
     valid = []
     for z in zones_15m(fifteen, direction, a15):
-        # A touch BEFORE a zone was confirmed is not a legitimate retest.
-        # Use only 5m candles whose close follows its 15m creation close.
-        after_zone = [c for c in five[-6:]
-                      if c.close_time >= fifteen[z.created].close_time]
-        if not after_zone:
-            continue
-        touched = (min(c.low for c in after_zone) <= z.high + .20 * a5 and
-                   max(c.high for c in after_zone) >= z.low - .20 * a5)
+        # Require one real 5m overlap occurring after 15m zone confirmation.
+        touched = has_confirmed_zone_touch(five, fifteen, z)
         close_enough = (z.low - .25 * a5 <= cur.close <= z.high + 1.20 * a5
                         if direction == 1 else
                         z.low - 1.20 * a5 <= cur.close <= z.high + .25 * a5)
