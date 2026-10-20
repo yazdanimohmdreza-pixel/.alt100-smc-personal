@@ -1,0 +1,1 @@
+# .alt100-smc-personal
