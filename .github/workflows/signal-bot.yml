@@ -1,0 +1,88 @@
+
+name: ALT100 SMC Personal
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Choose operation"
+        required: true
+        default: install
+        type: choice
+        options:
+          - install
+          - scan
+  schedule:
+    - cron: '2-59/5 * * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: alt100-personal
+  cancel-in-progress: false
+
+jobs:
+  install:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.task == 'install' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Extract and test robot
+        run: |
+          unzip -o ALT100-SMC-Personal.zip
+          python -m pip install -r requirements.txt
+          python -m unittest discover -s tests -v
+
+      - name: Save installed files
+        run: |
+          rm ALT100-SMC-Personal.zip
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --quiet || git commit -m "Install ALT100 SMC"
+          git push
+
+  scan:
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.task == 'scan') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Test strategy
+        run: python -m unittest discover -s tests -v
+
+      - name: Scan 100 coins
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SIGNAL_MIN_SCORE: '75'
+          MAX_COINS: '100'
+        run: python bot.py
+
+      - name: Save signal history
+        if: success()
+        run: |
+          if [ -f state/signals.json ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add state/signals.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Update signal history [skip ci]"
+              git push
+            fi
+          fi
