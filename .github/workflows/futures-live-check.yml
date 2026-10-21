@@ -1,0 +1,99 @@
+name: CoinWhisper Futures Live Connection Check
+
+# Read-only, manually launched network diagnostic. Not the trading/signal workflow.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-usdm:
+    name: Verify Binance USD-M from GitHub runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Check out project code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install project dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Verify live USD-M public market data
+        shell: bash
+        run: |
+          python - <<'PY'
+          import asyncio
+          from datetime import datetime, timezone
+          import time
+
+          import httpx
+
+          from futures_live_feed import _get, fetch_verified_snapshot
+          from strategy import closed_candles
+
+          SYMBOL = 'ETHUSDT'
+          BASE = 'https://fapi.binance.com'
+          PERIODS = {'1h': 3_600_000, '15m': 900_000, '5m': 300_000}
+          FRESH_LIMITS = {'1h': 70 * 60_000, '15m': 20 * 60_000, '5m': 9 * 60_000}
+
+          async def probe():
+              async with httpx.AsyncClient(
+                  limits=httpx.Limits(max_connections=6),
+                  headers={'User-Agent': 'CoinWhisper-Live-Connectivity-Probe/1.0'},
+              ) as client:
+                  # A real network call from this exact GitHub-hosted runner.
+                  server_res = await client.get(BASE + '/fapi/v1/time', timeout=12)
+                  server_res.raise_for_status()
+                  server_ms = int(server_res.json()['serverTime'])
+                  skew_ms = abs(int(time.time() * 1000) - server_ms)
+                  if skew_ms > 10_000:
+                      raise AssertionError(f'Clock skew too large: {skew_ms} ms')
+
+                  info = await _get(client, '/fapi/v1/exchangeInfo')
+                  contract = next((s for s in info['symbols'] if s.get('symbol') == SYMBOL), None)
+                  if (not contract or contract.get('status') != 'TRADING'
+                          or contract.get('contractType') != 'PERPETUAL'
+                          or contract.get('quoteAsset') != 'USDT'
+                          or contract.get('marginAsset') != 'USDT'):
+                      raise AssertionError('USD-M perpetual contract is not active')
+
+                  # Uses the EXACT validation function installed in the bot project.
+                  snapshot = await fetch_verified_snapshot(client, SYMBOL)
+                  if not 0 < snapshot.spread_pct < 1.0:
+                      raise AssertionError('Unexpected or invalid futures spread')
+
+                  counts = {}
+                  age_ms = {}
+                  for interval, duration in PERIODS.items():
+                      raw = await _get(client, '/fapi/v1/klines', {
+                          'symbol': SYMBOL, 'interval': interval, 'limit': 140,
+                      })
+                      now_ms = int(time.time() * 1000)
+                      candles = closed_candles(raw, now_ms)
+                      if len(candles) < 70:
+                          raise AssertionError(f'{interval}: fewer than 70 closed candles')
+                      latest = candles[-70:]
+                      if any(b.open_time - a.open_time != duration
+                             for a, b in zip(latest[:-1], latest[1:])):
+                          raise AssertionError(f'{interval}: non-contiguous candle history')
+                      age = now_ms - latest[-1].close_time
+                      if not 0 <= age <= FRESH_LIMITS[interval]:
+                          raise AssertionError(f'{interval}: stale or future candles, age={age}ms')
+                      counts[interval] = len(candles)
+                      age_ms[interval] = age
+
+                  checked = datetime.now(timezone.utc).isoformat(timespec='seconds')
+                  print('LIVE_FUTURES_OK: GitHub runner reached the real Binance USD-M API')
+                  print(f'Checked UTC: {checked} | symbol: {SYMBOL} | active perpetual: yes')
+                  print(f'Mark: {snapshot.mark_price:.6f} | Index: {snapshot.index_price:.6f}')
+                  print(f'Bid: {snapshot.bid:.6f} | Ask: {snapshot.ask:.6f} | Spread: {snapshot.spread_pct:.5f}%')
+                  print(f'Funding: {snapshot.funding_rate:+.8f} | Open Interest: {snapshot.open_interest:.3f}')
+                  for period in PERIODS:
+                      print(f'{period}: {counts[period]} closed real futures candles, latest age {age_ms[period]}ms')
+                  print('READ_ONLY=YES | API_KEY=NOT_REQUIRED | ORDERS=NONE | TELEGRAM_SEND=NONE')
+
+          asyncio.run(probe())
+          PY
