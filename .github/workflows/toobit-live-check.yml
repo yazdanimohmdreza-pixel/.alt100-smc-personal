@@ -1,0 +1,109 @@
+name: CoinWhisper Toobit Futures Live Check
+
+# Manual, read-only connectivity and freshness probe from a GitHub-hosted runner.
+# Does not access accounts, accept API keys, place orders, or send Telegram messages.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-toobit-usdtm:
+    name: Verify public Toobit USDT-M data from GitHub
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check real Toobit time, mark and futures bid-ask
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import math
+          import time
+          from datetime import datetime, timezone
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+
+          BASE = 'https://api.toobit.com'
+          CONTRACT = 'ETH-SWAP-USDT'
+
+          def get(path, params=None):
+              url = BASE + path + ('?' + urlencode(params) if params else '')
+              req = Request(url, headers={'User-Agent': 'CoinWhisper-Connectivity-Check/1.0',
+                                          'Accept': 'application/json'}, method='GET')
+              try:
+                  with urlopen(req, timeout=15) as response:
+                      status = response.status
+                      payload = json.loads(response.read(1_000_000).decode('utf-8'))
+              except HTTPError as exc:
+                  raise RuntimeError(f'{path}: HTTP {exc.code}; GitHub runner access denied or API error') from exc
+              except URLError as exc:
+                  raise RuntimeError(f'{path}: network/TLS/DNS error: {exc.reason}') from exc
+              if status != 200:
+                  raise RuntimeError(f'{path}: HTTP {status}')
+              if isinstance(payload, dict) and payload.get('code') not in (None, 200, '200'):
+                  raise RuntimeError(f'{path}: unexpected exchange error: {str(payload.get("code"))[:32]}')
+              return payload
+
+          def contract_row(payload, endpoint):
+              if isinstance(payload, list):
+                  rows = payload
+              elif isinstance(payload, dict):
+                  rows = payload.get('data') if isinstance(payload.get('data'), list) else [payload]
+              else:
+                  raise AssertionError(f'{endpoint}: invalid response shape')
+              for row in rows:
+                  if isinstance(row, dict) and row.get('symbolId', row.get('symbol', row.get('s'))) == CONTRACT:
+                      return row
+              raise AssertionError(f'{endpoint}: no data for {CONTRACT}')
+
+          def positive(value, label):
+              try:
+                  number = float(value)
+              except (ValueError, TypeError, OverflowError) as exc:
+                  raise AssertionError(f'{label}: missing/non-numeric') from exc
+              if not math.isfinite(number) or number <= 0:
+                  raise AssertionError(f'{label}: invalid price')
+              return number
+
+          def age_ms(exchange_time, name, max_age_ms=90_000):
+              try:
+                  age = int(time.time() * 1000) - int(exchange_time)
+              except (ValueError, TypeError, OverflowError) as exc:
+                  raise AssertionError(f'{name}: invalid timestamp') from exc
+              if not -10_000 <= age <= max_age_ms:
+                  raise AssertionError(f'{name}: stale/future data age={age}ms')
+              return age
+
+          server = get('/api/v1/time')
+          if not isinstance(server, dict) or 'serverTime' not in server:
+              raise AssertionError('time: missing serverTime')
+          clock_age = age_ms(server['serverTime'], 'server time', 30_000)
+          print(f'TOOBIT_TIME_OK: GitHub reached Toobit; clock difference {clock_age}ms', flush=True)
+
+          mark = contract_row(get('/quote/v1/markPrice', {'symbol': CONTRACT}), 'markPrice')
+          mark_price = positive(mark.get('price'), 'mark price')
+          mark_age = age_ms(mark.get('time'), 'mark price')
+          print(f'TOOBIT_MARK_OK: {CONTRACT} mark={mark_price:.6f} age={mark_age}ms', flush=True)
+
+          book = contract_row(get('/quote/v1/contract/ticker/bookTicker', {'symbol': CONTRACT}), 'bookTicker')
+          bid = positive(book.get('b'), 'bid')
+          ask = positive(book.get('a'), 'ask')
+          if not bid < ask:
+              raise AssertionError('bookTicker: crossed/invalid bid-ask')
+          quote_age = age_ms(book.get('t'), 'bookTicker')
+          spread_pct = 200 * (ask - bid) / (ask + bid)
+          if spread_pct > 1.0:
+              raise AssertionError(f'bookTicker: unusually wide spread {spread_pct:.3f}%')
+          print(f'TOOBIT_BOOK_OK: bid={bid:.6f} ask={ask:.6f} spread={spread_pct:.5f}% age={quote_age}ms', flush=True)
+
+          checked = datetime.now(timezone.utc).isoformat(timespec='seconds')
+          print(f'LIVE_TOOBIT_OK: public USDT-M futures data validated on GitHub runner at {checked}', flush=True)
+          print('SOURCE=TOOBIT_FUTURES | READ_ONLY=YES | API_KEY=NONE | ORDERS=NONE | SIGNALS=NONE', flush=True)
+          PY
